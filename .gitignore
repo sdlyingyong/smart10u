@@ -1,0 +1,10 @@
+# 本地凭据与运行产物：绝不入库
+config.yaml
+*.token
+*.db
+*.log
+.venv/
+__pycache__/
+.pytest_cache/
+CuktechBridge.app/
+.DS_Store

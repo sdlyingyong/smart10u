@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: cuktech-ble-server
+Version: 2.0.0b0
+Summary: CUKTECH 10 GaN Charger BLE Server for Home Assistant
+Requires-Python: >=3.10
+Requires-Dist: aiohttp>=3.9
+Requires-Dist: paho-mqtt>=2.0
+Requires-Dist: bleak>=0.21
+Requires-Dist: cryptography>=41
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: requests>=2.31
+Requires-Dist: pycryptodomex>=3.20
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"

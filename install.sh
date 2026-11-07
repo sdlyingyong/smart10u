@@ -38,7 +38,28 @@ else
   rm -f "$TMP"
 fi
 
-APP="$INSTALL_DIR/$APP_NAME.app"
+# app 要落在 Launchpad / Spotlight 会扫的目录，而不是安装目录。
+# 之前建在 ~/.smart10u/ 这种隐藏目录里，结果是：Finder 里看不见、启动台没有、
+# Spotlight 也搜不到（隐藏目录不建索引），只能靠命令行 open 才能起来。
+APP_DIR=""
+if [ -w /Applications ]; then
+  APP_DIR="/Applications"
+elif mkdir -p "$HOME/Applications" 2>/dev/null; then
+  APP_DIR="$HOME/Applications"
+else
+  APP_DIR="$INSTALL_DIR"
+  warn "没有可写的 Applications 目录，app 留在 $INSTALL_DIR（启动台里可能看不到）"
+fi
+[ -n "$APP_DIR" ] || die "无法确定 app 安装目录"
+APP="$APP_DIR/$APP_NAME.app"
+# 覆盖旧版本前先确认目标确实是一个 app bundle（或指向它的软链接），
+# 避免路径异常时误删别的东西。
+if [ -L "$APP" ]; then
+  rm -f "$APP"
+elif [ -d "$APP" ] && [ -f "$APP/Contents/Info.plist" ]; then
+  info "覆盖已有的 $APP"
+  rm -rf "$APP"
+fi
 
 PY=""
 for c in python3.13 python3.12 python3.11 python3.10 python3; do
@@ -137,7 +158,8 @@ if probe_health; then
 fi
 
 # 就绪后自动打开面板。必须放后台：下面 exec 会把当前进程换成服务本体。
-# 只等 /api/health 通，不等 BLE 认证（要 30s 左右）——让界面先出来并自己显示「连接中」。
+# 只等 /api/health 通，不等 BLE 认证（还要几秒）——让界面先出来，
+# 连接进度由面板自己显示（页头徽标会走 扫描中 / 连接中 / 认证中）。
 if [ "\$SILENT" = "0" ]; then
   (
     for i in {1..90}; do
@@ -182,7 +204,7 @@ cat <<EOF
 
 以后就用这个 app：$APP
   双击它 —— 服务没在跑就起服务并等就绪，已经在跑就直接把面板叫出来。
-  拖到「应用程序」或程序坞里，以后一键打开。
+  已经放在上面这个位置，启动台 / Finder 里都能直接找到。
 
 第一次还要做 3 件事：
   1. 若弹出「$APP_NAME 想使用蓝牙」，点“允许”；

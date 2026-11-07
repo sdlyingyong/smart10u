@@ -1705,10 +1705,23 @@ class BLEManager:
             # MiOT auth handshake -- only the connection-time identifier
             # needs to be the CoreBluetooth address bleak actually resolved.
             self.ctrl.mac = found.address
-        await self.ctrl.connect()
+        # 把扫描拿到的句柄一起交下去：BleakClient 收到地址字符串会自己再扫一遍
+        # 设备（默认 10s 超时），前面这轮扫描就白做了。传对象可跳过二次发现。
+        self.ctrl.ble_device = found
+        try:
+            await self.ctrl.connect()
+        except Exception:
+            # 这次用的可能是缓存的旧句柄（设备重启过、蓝牙被关过都会让它失效）。
+            # 丢掉缓存，逼下一次重新扫描，否则会一直拿坏句柄重试。
+            if self.adapter is not None:
+                self.adapter.forget_device(self.mac)
+            raise
 
         self.log.info("Connected, waiting for device to settle...")
-        await asyncio.sleep(2)
+        # 0.15s：`connect()` 返回时链路与 GATT 已就绪，这里只是给设备一个极短的
+        # 缓冲。实测 2s→0.5s→0.15s 三档首包与认证失败率没有变化（read_device_info
+        # 自带重试兜底），纯等待只会拖慢连接。
+        await asyncio.sleep(0.15)
 
         await self.ctrl.read_device_info()
         self.log.info("Connected, authenticating...")

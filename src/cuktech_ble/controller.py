@@ -54,6 +54,13 @@ class CuktechBLEController:
         self.mac = mac
         self.token = token
         self.mac_bytes = mac_str_to_bytes(mac)
+        # 扫描阶段拿到的 BLEDevice 句柄。**必须传对象而不是地址字符串**：
+        # BleakClient 收到 str 时，`connect()` 里会先跑一遍
+        # `BleakScanner.find_device_by_address(timeout=…)` 重新发现设备
+        # （默认 10s，扫不到就干等），前面那轮扫描完全白做。
+        # 传 BLEDevice 时 macOS 后端直接取 `details` 里的 CBPeripheral 发起连接，
+        # 跳过二次扫描。实测 11s → 1s 量级。
+        self.ble_device = None
         self.client = None
         self.authenticated = False
         self._notify_queues = {}
@@ -119,6 +126,22 @@ class CuktechBLEController:
         try:
             return await asyncio.wait_for(queue.get(), timeout)
         except asyncio.TimeoutError:
+            return None
+
+    def peek_notify(self, name):
+        """只看队首，**不消费**。空队列或拿不到返回 None。
+
+        用于"别的通道可能已经有结果了，先瞄一眼"这种场景：看到了就可以提前
+        跳出等待，结果仍然留在队列里给后续的 `wait_notify` 正常取走。
+        asyncio.Queue 的 `_queue` 是私有属性，这里兜住所有异常——取不到就当
+        没看到，退化成原来的纯等待行为，不会把认证流程带崩。
+        """
+        queue = self._notify_queues.get(name)
+        if not queue:
+            return None
+        try:
+            return queue._queue[0]
+        except (IndexError, AttributeError):
             return None
 
     def get_pending_notify(self, name):
@@ -204,7 +227,9 @@ class CuktechBLEController:
         """连接到设备。"""
         _LOGGER.info("Connecting to %s...", self.mac)
         self._disconnected = False
-        self.client = BleakClient(self.mac)
+        # 有扫描句柄就直接用（免掉 bleak 内部二次发现），否则退回地址字符串。
+        target = self.ble_device if self.ble_device is not None else self.mac
+        self.client = BleakClient(target)
         await self.client.connect()
         # NOTE: Bleak 3.x removed set_disconnected_callback / on_disconnect — there
         # is no callback API. Link loss is instead detected in the main loop by
@@ -552,10 +577,21 @@ class CuktechBLEController:
 
             # 读取 challenge + response + RCV_RDY
             while asyncio.get_running_loop().time() - deadline < 0:
+                # 本机实测（固件 2.1.2_0073）：这台 AD1204U 根本不在 auth_data 上
+                # 发挑战-应答，登录结果直接落在 auth_ctrl。原代码只等 auth_data，
+                # 于是每次连接都死等到 8s deadline 才去读 auth_ctrl —— 白扔 8 秒。
+                # 这里只 peek 不消费：结果仍留给下面的 wait_notify("auth_ctrl")。
+                queued = self.peek_notify("auth_ctrl")
+                if queued and queued[0] in (0x21, 0x11, 0x23, 0x12):
+                    _LOGGER.debug("  Phase6: auth_ctrl 结果已就绪 (0x%02x)，跳过等待", queued[0])
+                    break
+
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     break
-                data = await self.wait_notify("auth_data", timeout=min(remaining, 3.0))
+                # 分片等待：既要及时处理 auth_data 上的分段帧，又要让上面的
+                # auth_ctrl peek 有足够高的轮询频率（最坏多花 0.4s 才发现结果）。
+                data = await self.wait_notify("auth_data", timeout=min(remaining, 0.4))
                 if not data:
                     continue
                 _LOGGER.debug("  Phase6 auth_data: %s", data.hex())
@@ -747,7 +783,10 @@ class CuktechBLEController:
         self._dev_it_hi = 0      # reset device it rollover tracking (device it restarts at 0)
         self._last_dev_it_lo = 0
         self._miot_seq = 1  # MiOT 命令序列号 (从1开始)
-        await asyncio.sleep(0.5)
+        # 0.15s：认证成功后设备会立刻主动推一轮状态，这里只等它起飞。
+        # 真正的收帧交给下面的 _drain_pending_pushes / _drain_device_push
+        # （它们自带 6s 窗口和 0.8s 空转退出），不会因为这里短而漏数据。
+        await asyncio.sleep(0.15)
         await self._drain_pending_pushes()
         _LOGGER.info("Command channel ready")
 

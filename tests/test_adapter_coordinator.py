@@ -316,7 +316,7 @@ class TestScanCoalescing:
     async def test_one_discover_serves_all_waiters(self, coord, bt):
         discoveries = []
 
-        async def fake_discover(timeout):
+        async def fake_discover(timeout, wanted=None):
             discoveries.append(timeout)
             # 真扫描必然让出事件循环（几秒的 discover），这里用 sleep(0.01) 模拟，
             # 否则三个等待者会在"锁还没被占住"时依次跑完，合并根本没机会发生。
@@ -334,29 +334,46 @@ class TestScanCoalescing:
         assert bt.verbs().count("scan") == 1, "scan off 每窗口只该执行一次"
 
     async def test_mibeacon_service_data_matches_on_macos(self, coord, bt, monkeypatch):
-        """macOS 拿不到真 MAC：按 MiBeacon service-data 尾 6 字节匹配。"""
+        """macOS 拿不到真 MAC：按 MiBeacon service-data 尾 6 字节匹配。
+
+        `_discover` 已改成 start/stop + detection_callback（命中即停），
+        所以这里伪造一个扫描器，在 start() 之后喂一帧广播进来。
+        """
         import bleak
         from cuktech_ble.protocol import UUID_FE95, mac_str_to_bytes
 
         class Adv:
             service_data = {UUID_FE95: b"\x00\x00" + mac_str_to_bytes("AA:BB:CC:DD:EE:07")}
 
-        async def fake_discover(timeout=None, return_adv=False, **kw):
-            return {"random-core-bluetooth-uuid": ("dev-found", Adv())}
+        class FakeDev:
+            address = "random-core-bluetooth-uuid"
 
-        monkeypatch.setattr(bleak.BleakScanner, "discover",
-                            staticmethod(fake_discover))
-        assert await coord.find_device("AA:BB:CC:DD:EE:07", 5) == "dev-found"
+        fake_dev = FakeDev()
+
+        class FakeScanner:
+            def __init__(self, detection_callback=None, **kw):
+                self._cb = detection_callback
+
+            async def start(self):
+                # 广播在 start 之后才到，贴近真机时序
+                await asyncio.sleep(0.01)
+                self._cb(fake_dev, Adv())
+
+            async def stop(self):
+                pass
+
+        monkeypatch.setattr(bleak, "BleakScanner", FakeScanner)
+        assert await coord.find_device("AA:BB:CC:DD:EE:07", 5) is fake_dev
 
     async def test_missing_device_returns_none(self, coord, bt):
-        async def fake_discover(timeout):
+        async def fake_discover(timeout, wanted=None):
             return {}
 
         coord._discover = fake_discover
         assert await coord.find_device("AA:BB:CC:DD:EE:99", 5) is None
 
     async def test_scan_failure_returns_none_and_frees_waiter(self, coord, bt):
-        async def boom(timeout):
+        async def boom(timeout, wanted=None):
             raise RuntimeError("BlueZ said no")
 
         coord._discover = boom

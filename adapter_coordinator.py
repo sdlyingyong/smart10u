@@ -87,6 +87,12 @@ class AdapterCoordinator:
         self.log = log
         # 扫描合并：正在等结果的 MAC → 各自的 Future
         self._pending: dict[str, asyncio.Future] = {}
+        # 扫描结果缓存：mac → (取到时刻, BLEDevice)。
+        # macOS 上 _discover 不会提前返回，一次扫描固定等满 timeout；单设备场景下
+        # 掉线重连远多于首次发现，缓存句柄能把重连从「等满 timeout」压到几乎立即。
+        # 只在进程内有效，连接失败时用 forget_device() 主动失效，另加 TTL 兜底。
+        self._device_cache: dict[str, tuple[float, object]] = {}
+        self._device_cache_ttl = 600.0
         # 分级恢复的失败计数（按 MAC）
         self._l1_failures: dict[str, int] = {}
         self._l15_failures: dict[str, int] = {}
@@ -163,23 +169,87 @@ class AdapterCoordinator:
             return
         await self._bluetoothctl("scan", "off")
 
-    async def _discover(self, timeout: float) -> dict:
-        """一次真实扫描 → 两种索引：按地址、按 MiBeacon service-data 里的真 MAC。"""
+    async def _discover(self, timeout: float, wanted: set[str] | None = None) -> dict:
+        """一次真实扫描 → 两种索引：按地址、按 MiBeacon service-data 里的真 MAC。
+
+        **命中即停**：bleak 的 `BleakScanner.discover(timeout=)` 实现是
+        `async with scanner: await asyncio.sleep(timeout)`——纯睡满，扫到了也不
+        提前返回。设备广播间隔 100ms~1s，实测 1s 内就能拿到，剩下几秒全是白等。
+        这里改成 start + 轮询 + stop：`wanted` 里的 MAC 全部出现就立刻收工。
+
+        **为什么既挂 detection_callback 又轮询内部字典**：macOS 的
+        CoreBluetooth 回调存在延迟投递，只靠 callback 的 Event 会漏——实测出现过
+        「设备其实早已进了 `discovered_devices_and_advertisement_data`，但 Event
+        一直没 set，于是白等满 5s」。轮询内部字典等于直读真相，callback 只当
+        即时唤醒，两者互补。
+
+        `wanted` 为空时退化成等满 timeout，与原语义一致（可供不关心对象的调用方用）。
+        """
         from bleak import BleakScanner
         from cuktech_ble.protocol import UUID_FE95
 
-        found = await BleakScanner.discover(timeout=timeout, return_adv=True)
         index: dict[str, object] = {}
-        for addr, pair in found.items():
-            dev = pair[0] if isinstance(pair, tuple) else pair
-            adv = pair[1] if isinstance(pair, tuple) else None
-            index[str(addr).lower()] = dev
-            payload = ((getattr(adv, "service_data", None) or {}).get(UUID_FE95)
-                       if adv is not None else None)
+        # mac → MiBeacon 索引键，用于判断"这个 MAC 是否已经出现"
+        targets = {w.lower(): "miot:" + self._mac_bytes_hex(w)
+                   for w in (wanted or ())}
+        all_seen = asyncio.Event()
+
+        def _absorb(device, advertisement_data) -> None:
+            addr = str(getattr(device, "address", "")).lower()
+            if addr:
+                index[addr] = device
+            payload = ((getattr(advertisement_data, "service_data", None) or {})
+                       .get(UUID_FE95) if advertisement_data is not None else None)
             if payload and len(payload) >= 6:
                 # macOS/CoreBluetooth 从不暴露真 MAC（隐私随机化 UUID），
                 # 只能靠 MiBeacon service-data 尾 6 字节（真 MAC 的小端形式）确认身份。
-                index["miot:" + bytes(payload[-6:]).hex()] = dev
+                index["miot:" + bytes(payload[-6:]).hex()] = device
+
+        def _satisfied() -> bool:
+            return all(a in index or m in index for a, m in targets.items())
+
+        def _on_detect(device, advertisement_data) -> None:
+            _absorb(device, advertisement_data)
+            if targets and not all_seen.is_set() and _satisfied():
+                all_seen.set()
+
+        def _absorb_backend() -> None:
+            """直读 scanner 内部字典，补上回调延迟没送到的那些。"""
+            try:
+                for dev, adv in list(
+                        scanner.discovered_devices_and_advertisement_data.values()):
+                    _absorb(dev, adv)
+            except Exception:
+                pass
+
+        scanner = BleakScanner(detection_callback=_on_detect)
+        await scanner.start()
+        try:
+            if not targets:
+                await asyncio.sleep(timeout)
+            else:
+                loop = asyncio.get_running_loop()
+                end = loop.time() + timeout
+                while True:
+                    _absorb_backend()
+                    if _satisfied():
+                        break
+                    remaining = end - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(all_seen.wait(),
+                                               timeout=min(remaining, 0.15))
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            # stop() 在适配器被拔/系统蓝牙被关时会抛，不能让它盖住已扫到的结果
+            try:
+                await scanner.stop()
+            except Exception:
+                pass
+        # stop 之后可能还有最后一批广播落进字典（上面的 while 已经超时退出）
+        _absorb_backend()
         return index
 
     async def find_device(self, mac: str, timeout: float):
@@ -188,6 +258,15 @@ class AdapterCoordinator:
         返回 bleak 设备对象，找不到返回 None（调用方按"Charger not found"处理）。
         """
         key = mac.lower()
+
+        # 命中缓存直接复用设备句柄，跳过整轮扫描（省掉一次完整 timeout）
+        cached = self._device_cache.get(key)
+        if cached is not None:
+            if (asyncio.get_running_loop().time() - cached[0]) < self._device_cache_ttl:
+                self._log("info", "复用已缓存的 BLE 设备句柄，跳过扫描")
+                return cached[1]
+            self._device_cache.pop(key, None)
+
         pending = self._pending.get(key)
         if pending is not None and not pending.done():
             return await pending
@@ -202,7 +281,10 @@ class AdapterCoordinator:
                 await self.scan_cleanup()
                 try:
                     self.scans += 1
-                    index = await self._discover(timeout)
+                    # 这次扫描要服务所有还没拿到结果的等待者：把它们一起喂给
+                    # _discover 当提前返回条件，谁先到齐谁先解放，不必等满 timeout。
+                    wanted = {k for k, w in self._pending.items() if not w.done()}
+                    index = await self._discover(timeout, wanted)
                 except Exception as e:
                     self._log("warning", "BLE scan failed: %s", e)
                     index = {}
@@ -212,6 +294,9 @@ class AdapterCoordinator:
                         continue
                     dev = (index.get(waiter_key)
                            or index.get("miot:" + self._mac_bytes_hex(waiter_key)))
+                    if dev is not None:
+                        self._device_cache[waiter_key] = (
+                            asyncio.get_running_loop().time(), dev)
                     waiter.set_result(dev)
                 if not fut.done():          # 自己也不在 _pending 里了（防御）
                     fut.set_result(None)
@@ -226,6 +311,10 @@ class AdapterCoordinator:
             # 重连不上，也没有任何日志。按"这次没扫到"收尾，让它们照常重试。
             if not fut.done():
                 fut.set_result(None)
+
+    def forget_device(self, mac: str) -> None:
+        """丢弃缓存的设备句柄（连接失败时调用，逼下一次重新扫描）。"""
+        self._device_cache.pop(mac.lower(), None)
 
     @staticmethod
     def _mac_bytes_hex(mac: str) -> str:

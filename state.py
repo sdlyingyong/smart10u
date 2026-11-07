@@ -71,6 +71,11 @@ class ChargerState:
     def __init__(self):
         self.connected: bool = False
         self.authenticated: bool = False
+        # 建链阶段，给前端做「连接中」提示用：
+        #   idle → scanning → connecting → authenticating → ready
+        # 与 connected/authenticated 并存而不是替代：后者是终态真值，
+        # phase 只描述"现在卡在哪一步"，断线重连时前端据此显示进度。
+        self.phase: str = "idle"
         self.ports: Dict[int, PortState] = {i: PortState() for i in range(1, 5)}
         self.settings: Dict[str, int] = {}
         self.pdo_caps: Dict[str, dict] = {}
@@ -176,6 +181,15 @@ class ChargerState:
             self.authenticated = authenticated
             self._invalidate_cache()
 
+    async def set_phase(self, phase: str):
+        """更新建链阶段。相同值直接返回，避免高频重连时刷屏推送。"""
+        async with self._lock:
+            if self.phase == phase:
+                return False
+            self.phase = phase
+            self._invalidate_cache()
+            return True
+
     async def update_pdo_caps(self, pdo_caps: dict):
         async with self._lock:
             self.pdo_caps = pdo_caps
@@ -237,6 +251,7 @@ class ChargerState:
             self._cache = {
                 "connected": self.connected,
                 "authenticated": self.authenticated,
+                "phase": self.phase,
                 "ports": {k: self._port_payload(k, v, port_enabled)
                           for k, v in self.ports.items()},
                 "settings": dict(self.settings),

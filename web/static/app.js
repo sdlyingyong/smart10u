@@ -91,6 +91,7 @@
                 protocolExtend: 0,
                 connected: false,       // BLE 链路
                 authenticated: false,   // 认证通过（徽章要两者都为真）
+                phase: 'idle',          // 建链阶段：idle/scanning/connecting/authenticating/ready
                 bleConnected: false,    // 上面两者的合取：各处"能控制设备了吗"的判定
                 firmware: '',
                 scene: 1,               // 场景模式（本地最近一次已知值，含乐观更新）
@@ -133,7 +134,7 @@
             updateSettingsUI(dev.settings || {});
             renderCountdown(dev.settings || {});
             renderScene(dev.settings || {});
-            updateStatusBadge(dev.connected, dev.authenticated);
+            updateStatusBadge(dev.connected, dev.authenticated, undefined, dev.phase);
             updateBleButton();
             renderFirmwareChip();
             resetChartData();
@@ -1360,13 +1361,15 @@
         function updateUI(data) {
             dev.connected = !!data.connected;
             dev.authenticated = !!data.authenticated;
+            dev.phase = data.phase || 'idle';
             dev.bleConnected = !!(data.connected && data.authenticated);
             dev.ports = data.ports || {};
             if (data.settings) dev.settings = data.settings;
             if (data.firmware_version) dev.firmware = data.firmware_version;
             if (data.protocol_switches) dev.protocolSwitches = data.protocol_switches;
             if (data.protocol_extend !== undefined) dev.protocolExtend = data.protocol_extend;
-            updateStatusBadge(data.connected, data.authenticated, data.mqtt_connected);
+            updateStatusBadge(data.connected, data.authenticated,
+                              data.mqtt_connected, dev.phase);
             updateBleButton();
             renderPorts(data.ports);
             updateDeviceContainer(data.ports);
@@ -1466,9 +1469,38 @@
         }
 
         let _mqttConnected = false;
-        function updateStatusBadge(connected, authenticated, mqttConnected) {
+        // 建链阶段 → 徽标文案。phase 只描述"现在卡在哪一步"，终态仍由
+        // connected && authenticated 决定；没有 phase 就退回原来的"BLE"。
+        const PHASE_LABEL_KEY = {
+            scanning: 'common.scanning',
+            connecting: 'common.connectingDots',
+            authenticating: 'common.connecting',
+        };
+
+        function setStatusBadgeText(text) {
             const badge = document.getElementById('statusBadge');
-            badge.className = (connected && authenticated) ? 'status-badge connected' : 'status-badge disconnected';
+            if (!badge) return;
+            // 结构固定是 .status-dot + 文案 span，只改后者，圆点不动
+            const spans = badge.querySelectorAll('span');
+            if (spans.length >= 2) spans[spans.length - 1].textContent = text;
+        }
+
+        function updateStatusBadge(connected, authenticated, mqttConnected, phase) {
+            const badge = document.getElementById('statusBadge');
+            const ready = !!(connected && authenticated);
+            const phaseKey = (!ready && phase) ? PHASE_LABEL_KEY[phase] : null;
+
+            if (ready) {
+                badge.className = 'status-badge connected';
+                setStatusBadgeText('BLE');
+            } else if (phaseKey) {
+                // 黄色呼吸点 + 阶段名：别让用户对着"未连接"干等 4 秒
+                badge.className = 'status-badge connecting';
+                setStatusBadgeText(I18N.t(phaseKey));
+            } else {
+                badge.className = 'status-badge disconnected';
+                setStatusBadgeText('BLE');
+            }
 
             if (mqttConnected !== undefined) _mqttConnected = mqttConnected;
             const mqttBadge = document.getElementById('mqttBadge');
@@ -1478,14 +1510,23 @@
         function updateBleButton() {
             const btn = document.getElementById('bleToggle');
             if (!btn) return;
+            const phaseKey = (!dev.bleConnected && dev.phase) ? PHASE_LABEL_KEY[dev.phase] : null;
             if (dev.bleConnected) {
                 btn.textContent = I18N.t('common.disconnect');
                 btn.dataset.state = 'disconnect';
                 btn.className = 'btn btn-danger';
+                btn.disabled = false;
+            } else if (phaseKey) {
+                // 建链中：按钮跟着报阶段并锁住，避免连点排出第二条连接命令
+                btn.textContent = I18N.t(phaseKey);
+                btn.dataset.state = 'connecting';
+                btn.className = 'btn btn-primary';
+                btn.disabled = true;
             } else {
                 btn.textContent = I18N.t('common.connect');
                 btn.dataset.state = 'connect';
                 btn.className = 'btn btn-primary';
+                btn.disabled = false;
             }
         }
 
@@ -1832,7 +1873,11 @@
             evtSource = new EventSource(`${API_BASE}/api/events`);
             evtSource.onopen = () => {
                 console.log('SSE connected');
-                document.getElementById('statusBadge').className = 'status-badge connected';
+                // 不要在这里硬设绿色：SSE 通只代表浏览器连上了本机服务，
+                // 跟 BLE 有没有连上是两回事。按当前快照重绘即可，真实状态
+                // 会由随后的 init 事件刷进来。
+                updateStatusBadge(dev.connected, dev.authenticated,
+                                  _mqttConnected, dev.phase);
                 // SSE init event handles state sync; no fetchStatus needed
             };
             evtSource.onmessage = (e) => {
@@ -1852,9 +1897,21 @@
                             updateDeviceContainer(dev.ports);
                             break;
                         case 'status':
+                            // 纯阶段事件（服务端只发了 {phase}）不动连接真值，
+                            // 否则会把"重连中"误判成"已断开"而清空整屏读数。
+                            if (msg.connected === undefined) {
+                                dev.phase = msg.phase;
+                                updateStatusBadge(dev.connected, dev.authenticated,
+                                                  msg.mqtt_connected, dev.phase);
+                                break;
+                            }
+                            dev.connected = !!msg.connected;
+                            dev.authenticated = !!msg.authenticated;
+                            if (msg.phase) dev.phase = msg.phase;
                             dev.bleConnected = msg.connected && msg.authenticated;
                             dev.ports = dev.ports || {};
-                            updateStatusBadge(msg.connected, msg.authenticated, msg.mqtt_connected);
+                            updateStatusBadge(msg.connected, msg.authenticated,
+                                              msg.mqtt_connected, dev.phase);
                             updateBleButton();
                             renderFirmwareChip();
                             if (!dev.bleConnected) {

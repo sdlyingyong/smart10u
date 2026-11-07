@@ -22,6 +22,7 @@
             notSet: '未设置',
             loading: '加载中...',
             connected: '已连接',
+            scanning: '扫描中...',
             connecting: '认证中...',
             connectingDots: '连接中...',
             disconnecting: '断开中...',

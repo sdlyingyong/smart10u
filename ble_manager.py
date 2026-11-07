@@ -1659,6 +1659,7 @@ class BLEManager:
 
     async def _connect_locked(self):
         self.log.info("Scanning for charger...")
+        await self._set_phase("scanning")
 
         found = await self._scan_for_device()
 
@@ -1708,6 +1709,7 @@ class BLEManager:
         # 把扫描拿到的句柄一起交下去：BleakClient 收到地址字符串会自己再扫一遍
         # 设备（默认 10s 超时），前面这轮扫描就白做了。传对象可跳过二次发现。
         self.ctrl.ble_device = found
+        await self._set_phase("connecting")
         try:
             await self.ctrl.connect()
         except Exception:
@@ -1715,6 +1717,7 @@ class BLEManager:
             # 丢掉缓存，逼下一次重新扫描，否则会一直拿坏句柄重试。
             if self.adapter is not None:
                 self.adapter.forget_device(self.mac)
+            await self._set_phase("idle")
             raise
 
         self.log.info("Connected, waiting for device to settle...")
@@ -1723,6 +1726,7 @@ class BLEManager:
         # 自带重试兜底），纯等待只会拖慢连接。
         await asyncio.sleep(0.15)
 
+        await self._set_phase("authenticating")
         await self.ctrl.read_device_info()
         self.log.info("Connected, authenticating...")
         # 存储设备信息到 state
@@ -1738,6 +1742,7 @@ class BLEManager:
                 pass
             # 等待设备处理断连，避免旧连接未完全释放时新连接冲突
             await asyncio.sleep(3)
+            await self._set_phase("idle")
             raise AuthConnectionError("Auth failed")
 
         self._auth_fail_count = 0  # reset on successful auth
@@ -1745,6 +1750,8 @@ class BLEManager:
         self._ble_connect_time = time.time()
         self._last_notify_time = 0.0  # reset so quality shows "无" until first push
         await self.state.set_connection(True, True)
+        # 阶段置 ready 但这里不单独推，跟下面的连接状态一起发，少一帧
+        await self.state.set_phase("ready")
         self._invalidate()
         if self.adapter is not None:
             # 登记活链路：协调器据此判断"能不能下电"（§3.5 L2 准入条件），
@@ -1753,7 +1760,8 @@ class BLEManager:
         self.log.info("Authenticated!")
 
         # 立即推送连接状态，前端无需等待 15 个 PIID 读完
-        self._publish_status({"connected": True, "authenticated": True}, retain=True)
+        self._publish_status({"connected": True, "authenticated": True,
+                             "phase": "ready"}, retain=True)
 
         # 先读取 PIID 17 (c1_c2_protocol) 获取硬件协议代码
         # 再处理 init_push 端口数据，确保 hw_protocol 已就绪
@@ -1819,9 +1827,11 @@ class BLEManager:
             if was_connected and not self._stop_event.is_set():
                 self.log.error("BLE device disconnected unexpectedly")
         await self.state.set_connection(False, False)
+        await self.state.set_phase("idle")
         self._invalidate()
         self._publish_status({
             "connected": False,
+            "phase": "idle",
             "device_model": self.state.device_model,
             "firmware_version": self.state.firmware_version,
         }, retain=True)
@@ -2705,6 +2715,11 @@ class BLEManager:
         if self._mqtt_publish:
             self._mqtt_publish(self.topics.status, payload, retain=retain)
         self._sse_emit("status", payload)
+
+    async def _set_phase(self, phase: str):
+        """推进建链阶段并推给前端（值没变就不推，重连抖动时不刷屏）。"""
+        if await self.state.set_phase(phase):
+            self._publish_status({"phase": phase})
 
     def _publish_settings(self, retain=False):
         if self._mqtt_publish:

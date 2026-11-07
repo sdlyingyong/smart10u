@@ -22,6 +22,7 @@
             notSet: 'Not set',
             loading: 'Loading...',
             connected: 'Connected',
+            scanning: 'Scanning...',
             connecting: 'Authenticating...',
             connectingDots: 'Connecting...',
             disconnecting: 'Disconnecting...',

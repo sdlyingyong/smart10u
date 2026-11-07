@@ -7,4 +7,5 @@ config.yaml
 __pycache__/
 .pytest_cache/
 CuktechBridge.app/
+Smart10u.app/
 .DS_Store

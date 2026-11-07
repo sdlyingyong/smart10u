@@ -11,7 +11,7 @@ set -euo pipefail
 
 REPO="https://github.com/sdlyingyong/smart10u"
 TARBALL="$REPO/archive/refs/heads/main.tar.gz"
-APP_NAME="CuktechBridge"
+APP_NAME="Smart10u"
 PORT="${CUKTECH_PORT:-8199}"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -79,7 +79,7 @@ else
 fi
 
 info "构建 $APP_NAME.app（声明蓝牙用途，避免 macOS TCC 直接终止进程）"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -87,11 +87,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
   <key>CFBundleExecutable</key><string>launcher</string>
   <key>CFBundleIdentifier</key><string>local.smart10u.bridge</string>
-  <key>CFBundleName</key><string>CuktechBridge</string>
-  <key>CFBundleDisplayName</key><string>CuktechBridge</string>
+  <key>CFBundleName</key><string>Smart10u</string>
+  <key>CFBundleDisplayName</key><string>Smart10u</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>2.0.0</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+  <key>NSHighResolutionCapable</key><true/>
   <key>NSBluetoothAlwaysUsageDescription</key><string>连接并读取附近的酷态科充电器功率数据</string>
   <key>NSBluetoothPeripheralUsageDescription</key><string>连接并读取附近的酷态科充电器功率数据</string>
   <key>NSBluetoothUsageDescription</key><string>连接并读取附近的酷态科充电器功率数据</string>
@@ -99,13 +104,56 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+if [ -f "$INSTALL_DIR/assets/AppIcon.icns" ]; then
+  cp "$INSTALL_DIR/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+else
+  warn "缺少 assets/AppIcon.icns，应用图标将退回系统默认"
+fi
+
 cat > "$APP/Contents/MacOS/launcher" <<LAUNCH
 #!/bin/bash
-cd "$INSTALL_DIR"
-exec "$VPY" -u "$INSTALL_DIR/ha_server.py" >> "$INSTALL_DIR/server.console.log" 2>&1
+# Smart10u 启动器
+#   双击：服务已在跑 → 只把面板叫出来；未在跑 → 起服务，就绪后自动打开面板
+#   --silent：只起服务不弹面板（给开机自启用）
+APP_DIR="$INSTALL_DIR"
+PORT=$PORT
+URL="http://127.0.0.1:\$PORT/"
+HEALTH="http://127.0.0.1:\$PORT/api/health"
+SILENT=0
+
+cd "\$APP_DIR" || exit 1
+
+# --noproxy '*' 不能省：系统若注入 http_proxy，localhost 会被绕去代理然后超时
+probe_health() { curl -fsS --noproxy '*' --max-time 2 "\$HEALTH" >/dev/null 2>&1; }
+
+if [ "\$1" = "--silent" ] || [ "\$1" = "-s" ]; then
+  SILENT=1
+fi
+
+# 已在运行就不再起第二个进程（会抢 BLE 和端口），只打开面板
+if probe_health; then
+  [ "\$SILENT" = "1" ] || open "\$URL"
+  exit 0
+fi
+
+# 就绪后自动打开面板。必须放后台：下面 exec 会把当前进程换成服务本体。
+# 只等 /api/health 通，不等 BLE 认证（要 30s 左右）——让界面先出来并自己显示「连接中」。
+if [ "\$SILENT" = "0" ]; then
+  (
+    for i in {1..90}; do
+      sleep 1
+      if probe_health; then
+        open "\$URL"
+        exit 0
+      fi
+    done
+  ) &
+fi
+
+exec "$VPY" -u "\$APP_DIR/ha_server.py" >> "\$APP_DIR/server.console.log" 2>&1
 LAUNCH
 chmod +x "$APP/Contents/MacOS/launcher"
-codesign -s - -f "$APP" >/dev/null 2>&1 || warn "ad-hoc 签名失败，通常仍可运行"
+codesign -s - -f --deep "$APP" >/dev/null 2>&1 || warn "ad-hoc 签名失败，通常仍可运行"
 
 if [ "${CUKTECH_SKIP_START:-0}" = "1" ]; then
   info "已跳过启动（CUKTECH_SKIP_START=1）"
@@ -132,14 +180,19 @@ cat <<EOF
 
 安装完成。
 
-接下来 3 步：
-  1. 首次运行若弹出「$APP_NAME 想使用蓝牙」，点“允许”；
+以后就用这个 app：$APP
+  双击它 —— 服务没在跑就起服务并等就绪，已经在跑就直接把面板叫出来。
+  拖到「应用程序」或程序坞里，以后一键打开。
+
+第一次还要做 3 件事：
+  1. 若弹出「$APP_NAME 想使用蓝牙」，点“允许”；
      没弹窗就去 系统设置 → 隐私与安全性 → 蓝牙 里打开 $APP_NAME。
   2. 打开 http://127.0.0.1:$PORT/config.html
      点「小米云自动获取」→ 用米家 App 扫码 → 勾选充电头 → 保存并重启。
   3. 彻底退出米家 App（BLE 同一时间只允许一个连接）。
 
 面板    http://127.0.0.1:$PORT/
+应用    $APP
 配置    $INSTALL_DIR/config.yaml
 日志    $INSTALL_DIR/server.console.log
 EOF

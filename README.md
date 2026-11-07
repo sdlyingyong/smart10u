@@ -14,7 +14,7 @@
 curl -fsSL https://raw.githubusercontent.com/sdlyingyong/smart10u/main/install.sh | bash
 ```
 
-装到 `~/.smart10u`，自动建虚拟环境、生成带蓝牙用途声明的 `CuktechBridge.app`、启动服务。
+装到 `~/.smart10u`，自动建虚拟环境、生成带蓝牙用途声明的 `Smart10u.app`（自带图标）、启动服务并打开面板。
 
 也可以先 clone 再装：
 
@@ -28,13 +28,23 @@ git clone https://github.com/sdlyingyong/smart10u.git && cd Smart10u && ./instal
 CUKTECH_INSTALL_DIR="$HOME/Apps/smart10u" CUKTECH_PORT=18199 ./install.sh
 ```
 
+## 用起来
+
+双击 **Smart10u.app**（在 `~/.smart10u/` 下）就够了：
+
+- 服务没在跑 → 起服务，就绪后**自动打开面板**
+- 服务已经在跑 → 直接把面板叫出来，**不会起第二个进程**（避免两个进程抢同一个蓝牙连接）
+- 蓝牙连接是后台自动完成的，面板打开时可能还显示「连接中」，约 30 秒后自动变绿
+
+把它拖进「应用程序」或程序坞，以后一键就能看功率。要彻底停止服务，右键程序坞里的图标 → 退出，或 `pkill -f ha_server.py`。
+
 ## 装完 3 步
 
-1. **允许蓝牙**：首次启动若弹出「CuktechBridge 想使用蓝牙」，点允许；没弹窗就去 系统设置 → 隐私与安全性 → 蓝牙 打开它。
+1. **允许蓝牙**：首次启动若弹出「Smart10u 想使用蓝牙」，点允许；没弹窗就去 系统设置 → 隐私与安全性 → 蓝牙 打开它。
 2. **扫码绑定**：打开 <http://127.0.0.1:8199/config.html> → 「小米云自动获取」→ 米家 App 扫码 → 勾选充电头 → 保存并重启。
 3. **退出米家 App**：BLE 同一时间只允许一个连接，App 开着会把桥接挤掉。
 
-之后面板在 <http://127.0.0.1:8199/>。
+之后双击 app 就能打开面板（地址仍是 <http://127.0.0.1:8199/>）。
 
 ## 功能
 
@@ -84,13 +94,13 @@ CUKTECH_INSTALL_DIR="$HOME/Apps/smart10u" CUKTECH_PORT=18199 ./install.sh
 | `mqtt.enabled` | 默认 `false`；接 Home Assistant 时打开并填 broker |
 | `server.history_retention_days` | 历史采样保留天数，默认 2 |
 
-改完配置后重启：`open ~/.smart10u/CuktechBridge.app`（先 `pkill -f ha_server.py`）。
+改完配置后重启：`pkill -f ha_server.py`，然后双击 `~/.smart10u/Smart10u.app`。
 
 ## 常见问题
 
 **终端里直接跑 `python ha_server.py` 会崩**
 
-macOS TCC 要求可执行文件带 `NSBluetoothAlwaysUsageDescription`，命令行 Python 没有 `Info.plist` 会被直接终止（崩溃报告里写得很清楚）。必须用 `CuktechBridge.app` 启动。
+macOS TCC 要求可执行文件带 `NSBluetoothAlwaysUsageDescription`，命令行 Python 没有 `Info.plist` 会被直接终止（崩溃报告里写得很清楚）。必须用 `Smart10u.app` 启动。
 
 **二维码扫了没反应 / 提示过期**
 
@@ -110,7 +120,14 @@ macOS TCC 要求可执行文件带 `NSBluetoothAlwaysUsageDescription`，命令�
 
 **重启电脑后服务没了**
 
-没装开机自启。把 `CuktechBridge.app` 加进「登录项」，或自己写一个 launchd plist。
+**重启电脑后服务没了**
+
+默认没装开机自启，两种加法：
+
+- **简单**：把 `Smart10u.app` 拖进 系统设置 → 通用 → 登录项。开机会起服务，代价是每次登录多弹一个浏览器窗口。
+- **静默**（只起服务、不弹浏览器）：写个 LaunchAgent 到 `~/Library/LaunchAgents/local.smart10u.autostart.plist`，`ProgramArguments` 用 `/usr/bin/open -a <app路径> --args --silent`，再加 `RunAtLoad = true`。下次登录自动生效，想立即生效就 `launchctl bootstrap gui/$(id -u) <plist路径>`。
+
+必须经 `/usr/bin/open` 拉起，**不能**直接执行 app 里的 `launcher` —— 蓝牙 TCC 授权按 app bundle 识别，直接跑脚本拿不到蓝牙权限（会 SIGABRT）。
 
 **macOS 上能用 Docker 吗**
 

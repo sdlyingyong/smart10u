@@ -1601,6 +1601,22 @@ class Server:
         self.invalidate_status_cache()
         return web.json_response(result)
 
+    async def handle_rawget(self, request):
+        """只读探查接口：GET 任意 siid/piid，不写入、不改设备状态。
+
+        白名单只约束写操作；读操作对未知属性是安全的（属性不存在时设备不回包）。
+        """
+        try:
+            siid = int(request.query.get("siid", 2))
+            piid = int(request.query.get("piid", 0))
+        except (ValueError, TypeError):
+            return web.json_response(
+                {"ok": False, "error": "siid/piid must be integers"}, status=400)
+        if not (0 <= siid <= 255) or not (1 <= piid <= 255):
+            return web.json_response({"ok": False, "error": "out of range"}, status=400)
+        result = await self.ble.send_command("raw_get", (siid, piid), timeout=3.0)
+        return web.json_response(result)
+
     async def handle_port(self, request):
         try:
             body = await request.json()
@@ -3417,6 +3433,7 @@ app.router.add_get("/static/{tail:.*}", handle_cached_static)
 app.router.add_get("/api/health", lambda r: get_server().handle_health(r))
 app.router.add_get("/api/status", lambda r: get_server().handle_status(r))
 app.router.add_post("/api/set", lambda r: get_server().handle_set(r))
+app.router.add_get("/api/rawget", lambda r: get_server().handle_rawget(r))
 app.router.add_post("/api/port", lambda r: get_server().handle_port(r))
 app.router.add_post("/api/enable", lambda r: get_server().handle_enable(r))
 app.router.add_post("/api/protocol", lambda r: get_server().handle_protocol(r))

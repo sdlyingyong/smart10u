@@ -1025,6 +1025,50 @@ html[data-appearance="light"] .port-icon img { filter: invert(1); }
 }
 .port-protocol:not(.is-active) { background: rgba(128, 128, 128, 0.14); color: var(--text-dim); }
 
+/* ── 端口卡新增：硬件上限 / 实时协议码 / 协商上限 ──
+   两个「上限」语义不同，样式刻意做成两档：
+     .port-max  静态规格值，描边空心 → 不抢眼球
+     .port-cap  实时协商值，淡色填充 → 会变，值得看
+   空闲端口不渲染 .port-cap，避免「上限 0W」的误读。 */
+.port-hdr-right { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+
+.port-max {
+    font-size: 10.5px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 999px;
+    color: var(--text-dim);
+    border: 1px solid rgba(128, 128, 128, 0.28);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.port-proto-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+    max-width: 72%;
+    min-width: 0;
+}
+/* 徽标已收进 wrap，百分比宽度改为由 wrap 约束 */
+.port-proto-wrap .port-protocol { max-width: none; min-width: 0; }
+
+.port-cap {
+    font-style: normal;
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 5px;
+    border-radius: 6px;
+    background: rgba(var(--accent-rgb), 0.12);
+    color: var(--accent-ink);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    flex: none;
+}
+
+.port-proto-num { font-weight: 600; opacity: 0.72; margin-left: 3px; font-size: 9.5px; }
+
 /* ── 开关：与 phone.css .toggle 同规格（51×31 / 绿 #34C759） ── */
 .port-toggle { position: relative; display: inline-block; width: 51px; height: 31px; flex: none; }
 .port-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }

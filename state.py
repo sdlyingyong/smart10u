@@ -237,15 +237,34 @@ class ChargerState:
             self._cache = {
                 "connected": self.connected,
                 "authenticated": self.authenticated,
-                "ports": {k: {**v.to_dict(), "enabled": port_enabled.get(k, False)} for k, v in self.ports.items()},
+                "ports": {k: self._port_payload(k, v, port_enabled)
+                          for k, v in self.ports.items()},
                 "settings": dict(self.settings),
                 "protocol_extend": self._protocol_extend,
                 "protocol_switches": self.protocol_switches,
                 "device_model": self.device_model,
                 "firmware_version": self.firmware_version,
+                "pdo_caps": self.pdo_caps,
             }
             self._cache_valid = True
             return self._cache
+
+    def _port_payload(self, piid, port_state, port_enabled):
+        """端口输出：基础遥测 + 端口使能 + 实时协商能力。
+
+        cap_power_w / proto_code 来自 PIID 17/18 的 PDO 能力字：
+          每半字 = [协议号:1B][协商功率上限W:1B]，与 decode_pdo_caps 对齐。
+        端口空闲时设备给 0，这里统一归一化为 None（前端显示为「—」），
+        避免把「没插设备」误读成「上限 0W」。
+        """
+        payload = port_state.to_dict() if port_state is not None else dict(PORT_DEFAULT)
+        payload["enabled"] = port_enabled.get(piid, False)
+        name = PORT_NAMES.get(piid)
+        caps = self.pdo_caps.get("c1c2" if piid <= 2 else "c3a", {}) or {}
+        cap = caps.get(name) or {}
+        payload["cap_power_w"] = cap.get("power_w")
+        payload["proto_code"] = cap.get("proto")
+        return payload
 
 
 def decode_port(piid, pt, pdo_data=None, protocol_switches=None, hw_protocol=None):

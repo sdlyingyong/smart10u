@@ -1754,13 +1754,12 @@ class BLEManager:
             self.ctrl.init_push_frames = []
 
         # Build full state for status event
-        ports_data = {}
         port_ctl = self.state.settings.get("16", 0x0F)
-        for piid, pname in PORT_NAMES.items():
-            ps = self.state.ports.get(piid)
-            port_data = ps.to_dict() if ps else dict(PORT_DEFAULT)
-            port_data["enabled"] = bool(port_ctl & (1 << (piid - 1)))
-            ports_data[str(piid)] = port_data
+        port_enabled = {i: bool(port_ctl & (1 << (i - 1))) for i in (1, 2, 3, 4)}
+        ports_data = {
+            str(piid): self.state._port_payload(piid, self.state.ports.get(piid), port_enabled)
+            for piid in PORT_NAMES
+        }
         self._publish_status({
             "connected": True,
             "authenticated": True,
@@ -1770,6 +1769,7 @@ class BLEManager:
             "settings": self.state.settings,
             "protocol_switches": self.state.protocol_switches,
             "protocol_extend": self.state.protocol_extend,
+            "pdo_caps": self.state.pdo_caps,
         }, retain=True)
 
         await asyncio.sleep(2)
@@ -2169,6 +2169,14 @@ class BLEManager:
             data = dict(PORT_DEFAULT)
             data["enabled"] = False
 
+        # 追加实时协商能力：PIID17/18 的 PDO 能力字
+        # 布局 [协议号:1B][协商功率上限W:1B]，与 decode_pdo_caps 对齐。
+        # 端口空闲时设备给 0 → 归一化为 None，交给前端显示「—」。
+        pname = PORT_NAMES[piid]
+        cap = (self.state.pdo_caps.get("c1c2" if piid <= 2 else "c3a", {}) or {}).get(pname) or {}
+        data["cap_power_w"] = cap.get("power_w")
+        data["proto_code"] = cap.get("proto")
+
         self._publish_port(PORT_NAMES[piid], data, retain=True)
         self._sse_emit("port_update", {"port_id": piid, "port": PORT_NAMES[piid], "data": data})
 
@@ -2210,6 +2218,8 @@ class BLEManager:
                     await self._handle_port_command(cmd_data, cmd_future)
                 elif cmd_type == "verify_port":
                     await self._handle_verify_port(cmd_data, cmd_future)
+                elif cmd_type == "raw_get":
+                    await self._handle_raw_get(cmd_data, cmd_future)
 
             except ConnectionError:
                 # A command handler deliberately forced this to signal the
@@ -2221,6 +2231,35 @@ class BLEManager:
                 self.log.error("Command error: %s", e)
                 if cmd_future and not cmd_future.done():
                     cmd_future.set_result({"ok": False, "error": str(e)})
+
+    async def _handle_raw_get(self, cmd_data, cmd_future):
+        """只读探查：读任意 (siid, piid) 当前值，用于协议逆向。
+
+        安全边界：只发 GET，永不写入；不做白名单校验（白名单只约束写）。
+        短超时 1.5s：属性不存在时设备不回包，必须快速跳过。
+        """
+        siid, piid = cmd_data
+        try:
+            res = await self.ctrl.send_miot_command(siid, piid, timeout=1.5)
+        except Exception as e:  # noqa: BLE001
+            if cmd_future and not cmd_future.done():
+                cmd_future.set_result({"ok": False, "error": repr(e)})
+            return
+        if not res or res.get("value") is None:
+            if cmd_future and not cmd_future.done():
+                cmd_future.set_result(
+                    {"ok": False, "siid": siid, "piid": piid,
+                     "error": "no_response_or_rejected"})
+            return
+        raw = res.get("raw")
+        if cmd_future and not cmd_future.done():
+            cmd_future.set_result({
+                "ok": True,
+                "siid": siid,
+                "piid": piid,
+                "value": res.get("value"),
+                "raw": raw.hex() if isinstance(raw, (bytes, bytearray)) else None,
+            })
 
     async def _handle_set_command(self, cmd_data, cmd_future):
         piid, value = cmd_data

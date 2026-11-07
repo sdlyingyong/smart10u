@@ -1425,11 +1425,31 @@
             card.classList.toggle('is-charging', charging);
             const va = card.querySelector('.port-va');
             if (va) va.textContent = `${merged.voltage.toFixed(1)}V · ${merged.current.toFixed(1)}A`;
-            // 协议徽标文字 + 选中态
+            // 协议徽标：名称 + 实时协议码 + 当前协商上限（上限徽标按需增删）
             const protoEl = card.querySelector('.port-protocol');
+            const capW = (merged.cap_power_w > 0) ? merged.cap_power_w : null;
+            const protoNum = (merged.proto_code > 0) ? merged.proto_code : null;
             if (protoEl) {
-                protoEl.textContent = merged.protocol;
+                protoEl.innerHTML = `${merged.protocol}${protoNum ? `<b class="port-proto-num">#${protoNum}</b>` : ''}`;
                 protoEl.classList.toggle('is-active', merged.protocol !== 'idle');
+                protoEl.title = protoNum
+                    ? `协议码 #${protoNum}${capW ? ` · 当前协商上限 ${capW}W` : ''}`
+                    : '端口空闲，未协商协议';
+            }
+            const wrap = card.querySelector('.port-proto-wrap');
+            if (wrap) {
+                let capEl = wrap.querySelector('.port-cap');
+                if (capW) {
+                    if (!capEl) {
+                        capEl = document.createElement('i');
+                        capEl.className = 'port-cap';
+                        capEl.title = '当前协商功率上限';
+                        wrap.insertBefore(capEl, wrap.firstChild);
+                    }
+                    capEl.textContent = `≤${capW}W`;
+                } else if (capEl) {
+                    capEl.remove();
+                }
             }
             // Update active class (enabled comes from PIID 16, not BLE data)
             card.classList.toggle('active', merged.enabled !== false);
@@ -1489,6 +1509,18 @@
                 // 负载条的分母是本口上限（见 PORT_MAX_W），不是实时功率的比例——
                 // 必须写在提示里，否则"22W 只填了 18%"看起来像 bug。
                 const basis = I18N.t('index.loadBasis', { max: PORT_MAX_W[id] || 100 });
+                // 两个「上限」语义不同，不能混：
+                //   maxW  = 硬件规格上限（静态常量，负载条分母）
+                //   capW  = 设备此刻实际协商到的功率上限（PIID17/18 的 PDO 能力字，实时）
+                // 端口空闲时设备给 0，后端归一化为 null，这里一律按「无」处理，
+                // 否则会把「没插设备」显示成「上限 0W」。
+                const maxW = PORT_MAX_W[id] || 100;
+                const maxWTitle = `该口硬件最大输出 ${maxW}W（规格值）`;
+                const capW = (port.cap_power_w > 0) ? port.cap_power_w : null;
+                const protoNum = (port.proto_code > 0) ? port.proto_code : null;
+                const protoTitle = protoNum
+                    ? `协议码 #${protoNum}${capW ? ` · 当前协商上限 ${capW}W` : ''}`
+                    : '端口空闲，未协商协议';
                 html += `
                     <div class="port-card ${checked ? 'active' : ''}${port.power > 0 ? ' is-charging' : ''}" id="port-${id}" onclick="handlePortClick(event, ${id})">
                         <div class="port-header">
@@ -1496,10 +1528,13 @@
                                 <span class="port-icon"><img id="portIcon${key.toUpperCase()}" src="/static/plugin_imgs/main_card_port_${key}_${checked ? 'on' : 'off'}.png" alt=""></span>
                                 ${name}
                             </span>
-                            <label class="port-toggle" onclick="event.stopPropagation()">
-                                <input type="checkbox" id="toggle-${key}" ${checked ? 'checked' : ''} onchange="togglePort('${key}', this.checked)">
-                                <span class="toggle-slider"></span>
-                            </label>
+                            <span class="port-hdr-right">
+                                <span class="port-max" title="${maxWTitle}">${maxW}W</span>
+                                <label class="port-toggle" onclick="event.stopPropagation()">
+                                    <input type="checkbox" id="toggle-${key}" ${checked ? 'checked' : ''} onchange="togglePort('${key}', this.checked)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </span>
                         </div>
                         <div class="port-power" title="${basis}">
                             <span class="port-power-value">${port.power.toFixed(1)}</span><span class="port-power-unit">W</span>
@@ -1507,7 +1542,10 @@
                         <div class="port-load${pct ? '' : ' is-idle'}" title="${basis}"><div class="port-load-fill" data-port="${id}" style="width:${pct}%"></div></div>
                         <div class="port-sub">
                             <span class="port-va">${port.voltage.toFixed(1)}V · ${port.current.toFixed(1)}A</span>
-                            <span class="port-protocol">${port.protocol}</span>
+                            <span class="port-proto-wrap">
+                                ${capW ? `<i class="port-cap" title="当前协商功率上限">≤${capW}W</i>` : ''}
+                                <span class="port-protocol ${port.protocol !== 'idle' ? 'is-active' : ''}" title="${protoTitle}">${port.protocol}${protoNum ? `<b class="port-proto-num">#${protoNum}</b>` : ''}</span>
+                            </span>
                         </div>
                     </div>`;
             }

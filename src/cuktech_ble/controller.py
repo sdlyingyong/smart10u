@@ -868,7 +868,7 @@ class CuktechBLEController:
             tl & 0xFF, (tl >> 8) & 0xFF,
         ]) + value_bytes
 
-    async def send_miot_command(self, siid, piid, value=None):
+    async def send_miot_command(self, siid, piid, value=None, timeout=8.0):
         """发送 MiOT BLE 命令并返回解析后的响应。
 
         MiOT/Spec TLV 帧格式 (对齐米家 SpecWriteChannelManager):
@@ -906,9 +906,9 @@ class CuktechBLEController:
 
         # 接收响应 (根据 opcode 区分)
         if value is not None:
-            return await self._recv_set_response(siid, piid, timeout=8.0)
+            return await self._recv_set_response(siid, piid, timeout=timeout)
         else:
-            return await self._recv_get_response(siid, piid, timeout=8.0)
+            return await self._recv_get_response(siid, piid, timeout=timeout)
 
     async def _recv_set_response(self, siid, piid, timeout=8.0):
         """接收 SET 命令的响应: 期望 ACK (B4=0x01) + Result (B4=0x04)。"""

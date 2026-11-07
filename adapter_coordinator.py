@@ -93,6 +93,11 @@ class AdapterCoordinator:
         # 只在进程内有效，连接失败时用 forget_device() 主动失效，另加 TTL 兜底。
         self._device_cache: dict[str, tuple[float, object]] = {}
         self._device_cache_ttl = 600.0
+        # 快速通道用的 (BleakScanner, CentralManagerDelegate)：只借用其 manager
+        # 查系统已知外设表，不启动扫描。必须一直持有，否则 manager 被 GC。
+        self._retrieve_holder: tuple[object, object] | None = None
+        # 快速通道连续连接失败计数：满 2 次就丢弃磁盘上的 UUID
+        self._peer_fail: dict[str, int] = {}
         # 分级恢复的失败计数（按 MAC）
         self._l1_failures: dict[str, int] = {}
         self._l15_failures: dict[str, int] = {}
@@ -252,6 +257,113 @@ class AdapterCoordinator:
         _absorb_backend()
         return index
 
+    # ─────────── 快速通道：按记住的 CoreBluetooth UUID 取回句柄 ───────────
+
+    def _peer_store_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            ".ble_peer.json")
+
+    def _load_peer(self, mac: str) -> str | None:
+        import json
+        try:
+            with open(self._peer_store_path(), "r", encoding="utf-8") as f:
+                value = json.load(f).get(mac.lower())
+            return value if isinstance(value, str) and value else None
+        except Exception:
+            return None
+
+    def _save_peer(self, mac: str, uuid_str: str) -> None:
+        """记住这台设备在 CoreBluetooth 里的 UUID，供下次启动免扫描。"""
+        import json
+        import sys
+        if sys.platform != "darwin" or not uuid_str:
+            return
+        # 只有形如 UUID 的才存：Linux 上 address 是真 MAC，存了也没用
+        if len(uuid_str) != 36 or uuid_str.count("-") != 4:
+            return
+        try:
+            path = self._peer_store_path()
+            data = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+            if data.get(mac.lower()) == uuid_str:
+                return
+            data[mac.lower()] = uuid_str
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._log("debug", "保存 BLE peer UUID 失败: %s", e)
+
+    def _forget_peer(self, mac: str) -> None:
+        import json
+        try:
+            path = self._peer_store_path()
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.pop(mac.lower(), None) is not None:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    async def _retrieve_by_uuid(self, mac: str):
+        """按上次记住的 UUID 直接从 CoreBluetooth 取回 CBPeripheral（不扫描）。
+
+        设备省电广播间隔约 4s，扫一轮至少等一个完整周期；而
+        `retrievePeripheralsWithIdentifiers_` 直接查系统已知外设表，瞬间返回。
+        取不到（换过机器 / 蓝牙服务重启 / 设备从没连过）就返回 None，调用方
+        照常回落扫描，行为与改动前一致。
+        """
+        import sys
+        if sys.platform != "darwin":
+            return None
+        uuid_str = self._load_peer(mac)
+        if not uuid_str:
+            return None
+        try:
+            from Foundation import NSUUID
+            from bleak import BleakScanner
+            from bleak.backends.device import BLEDevice
+        except Exception:
+            return None
+
+        try:
+            # scanner 只用来拿 manager，不 start()（start 会真的开扫）。
+            # 必须持有引用：manager 被 GC 掉，BLEDevice.details 里的连接上下文就没了。
+            if self._retrieve_holder is None:
+                scanner = BleakScanner()
+                manager = getattr(getattr(scanner, "_backend", None), "_manager", None)
+                if manager is None:
+                    return None
+                self._retrieve_holder = (scanner, manager)
+            _, manager = self._retrieve_holder
+
+            await manager.wait_until_ready()
+            # 注意：这个 API 收的是 NSUUID（CBPeripheral.identifier），
+            # 不是 CBUUID。传 CBUUID 不会报错，只会静默返回空数组。
+            # pyobjc 里也没有 UUIDWithString_ 这个类方法，得 alloc/init。
+            ns_uuid = NSUUID.alloc().initWithUUIDString_(uuid_str)
+            if ns_uuid is None:
+                self._forget_peer(mac)
+                return None
+            found = manager.central_manager.retrievePeripheralsWithIdentifiers_(
+                [ns_uuid])
+            peripherals = list(found) if found else []
+            if not peripherals:
+                self._log("info", "系统里找不到记住的 UUID（%s），回落扫描", uuid_str)
+                self._forget_peer(mac)
+                return None
+            return BLEDevice(address=uuid_str, name=None,
+                             details=(peripherals[0], manager))
+        except Exception as e:
+            self._log("warning", "按 UUID 取回设备失败: %s，回落扫描", e)
+            return None
+
     async def find_device(self, mac: str, timeout: float):
         """找设备；同一窗口内的多个等待者共享**一次**扫描。
 
@@ -266,6 +378,16 @@ class AdapterCoordinator:
                 self._log("info", "复用已缓存的 BLE 设备句柄，跳过扫描")
                 return cached[1]
             self._device_cache.pop(key, None)
+
+        # 快速通道：进程内没缓存，但磁盘上记着上次的 CoreBluetooth UUID。
+        # 设备省电广播间隔约 4s，扫一轮至少等一个周期；而 macOS 记得所有见过的
+        # 外设，按 UUID 取回句柄不需要扫描。
+        retrieved = await self._retrieve_by_uuid(key)
+        if retrieved is not None:
+            self._device_cache[key] = (
+                asyncio.get_running_loop().time(), retrieved)
+            self._log("info", "按上次记住的 UUID 直接取回设备，跳过扫描")
+            return retrieved
 
         pending = self._pending.get(key)
         if pending is not None and not pending.done():
@@ -297,6 +419,10 @@ class AdapterCoordinator:
                     if dev is not None:
                         self._device_cache[waiter_key] = (
                             asyncio.get_running_loop().time(), dev)
+                        # 记住 UUID：下次进程重启就能走快速通道，不必再等一个
+                        # 广播周期（实测 4s）。
+                        self._save_peer(waiter_key,
+                                        str(getattr(dev, "address", "")))
                     waiter.set_result(dev)
                 if not fut.done():          # 自己也不在 _pending 里了（防御）
                     fut.set_result(None)
@@ -314,7 +440,18 @@ class AdapterCoordinator:
 
     def forget_device(self, mac: str) -> None:
         """丢弃缓存的设备句柄（连接失败时调用，逼下一次重新扫描）。"""
-        self._device_cache.pop(mac.lower(), None)
+        key = mac.lower()
+        self._device_cache.pop(key, None)
+        # 快速通道按 UUID 取回的句柄可能是失效的（设备重置过 / 系统清过蓝牙
+        # 缓存）。一次失败先只丢内存缓存——设备临时走开也会失败；连续两次
+        # 才认定这个 UUID 不可信，删掉它，逼下次真正扫描并写入新的。
+        fails = self._peer_fail.get(key, 0) + 1
+        if fails >= 2:
+            self._peer_fail.pop(key, None)
+            self._forget_peer(key)
+            self._log("info", "连续 %d 次连接失败，已丢弃记住的 UUID", fails)
+        else:
+            self._peer_fail[key] = fails
 
     @staticmethod
     def _mac_bytes_hex(mac: str) -> str:
@@ -541,6 +678,7 @@ class AdapterCoordinator:
         self._stuck_devices.discard(mac)
         self._l1_failures.pop(_key(mac), None)
         self._l15_failures.pop(_key(mac), None)
+        self._peer_fail.pop(_key(mac), None)   # 连上了，之前记的失败次数作废
         self.clear_backoff(mac)
 
 

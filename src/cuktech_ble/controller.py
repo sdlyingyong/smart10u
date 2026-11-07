@@ -229,7 +229,10 @@ class CuktechBLEController:
         self._disconnected = False
         # 有扫描句柄就直接用（免掉 bleak 内部二次发现），否则退回地址字符串。
         target = self.ble_device if self.ble_device is not None else self.mac
-        self.client = BleakClient(target)
+        # timeout 默认 30s 太长：快速通道可能拿回一个已失效的旧句柄，
+        # 那种情况下 30s 才超时会把重连拖成"卡死"。10s 与 bleak 内部
+        # CentralManagerDelegate.connect 的默认值一致，够用且不会长时间挂住。
+        self.client = BleakClient(target, timeout=10.0)
         await self.client.connect()
         # NOTE: Bleak 3.x removed set_disconnected_callback / on_disconnect — there
         # is no callback API. Link loss is instead detected in the main loop by
